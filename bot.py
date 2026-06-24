@@ -31,17 +31,22 @@ from rich import box
 from rich.text import Text
 
 from config import (
+    ASSET_COOLDOWN_MINUTES,
+    ASSET_COOLDOWN_SECONDS,
+    ASSET_MAX_CUMULATIVE_LOSS,
     PNL_FILES,
     TOTAL_BOTS,
     TRADING_ASSETS,
     TRADING_ASSETS_UPPER,
     binance_futures_symbol,
+    validate_asset_cooldown_config,
     validate_trading_assets,
 )
 
 console = Console()
 load_dotenv()
 validate_trading_assets()
+validate_asset_cooldown_config()
 
 # ── Structured trade logger ──────────────────────────────────────────────────
 _exec_logger = logging.getLogger("emiliano.execution")
@@ -360,6 +365,46 @@ def log_weekend_block(asset_type: str, side: str, price_cents: int) -> None:
     )
 
 
+# Throttle per-asset cooldown block logs (same pattern as weekend gate).
+_last_cooldown_log_ts: Dict[str, float] = {}
+_COOLDOWN_LOG_INTERVAL_SEC: float = 60.0
+
+
+def log_cooldown_block(asset_type: str, side: str, price_cents: int) -> None:
+    """Emit a throttled log when new entries are blocked by asset cooldown."""
+    global _last_cooldown_log_ts
+    asset_key = asset_type.lower()
+    now = t.time()
+    last = _last_cooldown_log_ts.get(asset_key, 0.0)
+    if now - last < _COOLDOWN_LOG_INTERVAL_SEC:
+        return
+    _last_cooldown_log_ts[asset_key] = now
+
+    status = asset_cooldown.get_status(asset_key)
+    until  = status.get("cooldown_until_utc") or "unknown"
+    remaining = status.get("cooldown_remaining_sec", 0)
+    window_pnl  = status.get("cooldown_window_pnl", 0.0)
+
+    msg = (
+        f"🚫 [COOLDOWN] [{asset_type.upper()}] New-position entry BLOCKED — "
+        f"cooldown window PnL ${window_pnl:.2f} (limit -${ASSET_MAX_CUMULATIVE_LOSS:.2f}). "
+        f"Trading disabled until {until} UTC "
+        f"({remaining // 60}m {remaining % 60}s remaining). "
+        f"Would have bought {side} @ {price_cents}c. "
+        f"Existing TP/SL monitoring continues normally."
+    )
+    print(msg)
+    exec_log(
+        "entry_blocked_cooldown",
+        asset=asset_type,
+        side=side,
+        price_cents=price_cents,
+        cooldown_window_pnl=window_pnl,
+        cooldown_until_utc=until,
+        cooldown_remaining_sec=remaining,
+    )
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # TRADE STATE MACHINE
 # ═════════════════════════════════════════════════════════════════════════════
@@ -445,6 +490,242 @@ def redis_get_json(key: str) -> Optional[Any]:
         return json.loads(raw)
     except Exception:
         return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ASSET-LEVEL CIRCUIT BREAKER / COOLDOWN
+#
+# Risk-management tracker ONLY — separate from lifetime cumulative_pnl stored in
+# emiliano:{asset}:stats, emiliano:{asset}:trades, portfolio history, and local
+# {asset}_pnl_history.json. Those historical values are never read or modified
+# by this module.
+#
+# Redis key   : emiliano:{asset}:cooldown
+# Local fallback : {asset}_cooldown_state.json
+#
+# Cooldown-window PnL (Option A — reset after cooldown expires)
+# ───────────────────────────────────────────────────────────────
+# • window_pnl starts at 0 when the bot starts or when a cooldown expires.
+# • Each completed trade adds its realized pnl_amount (same value passed to
+#   log_pnl() on TP/SL/HODL exit — not unrealized mark-to-market).
+# • Breach when window_pnl <= -ASSET_MAX_CUMULATIVE_LOSS → trigger cooldown.
+# • When cooldown expires, window_pnl resets to 0 (fresh risk window).
+#
+# Events that update window_pnl
+# ─────────────────────────────
+# • MarketWorker.log_pnl() after every validated trade close (STOP_LOSS,
+#   TAKE_PROFIT, HODL settlement, manual cashout).
+#
+# Events that do NOT update window_pnl
+# ────────────────────────────────────
+# • Opening a position (BUY fill) — no realized PnL yet.
+# • Unrealized position PnL while FILLED.
+# • Any writes to lifetime stats / trade history / portfolio chart.
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _cooldown_redis_key(asset: str) -> str:
+    return f"emiliano:{asset.lower()}:cooldown"
+
+
+def _cooldown_local_path(asset: str) -> str:
+    return f"{asset.lower()}_cooldown_state.json"
+
+
+class AssetCooldownManager:
+    """Per-asset circuit breaker with Redis + local JSON persistence."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._state: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _empty_state() -> Dict[str, Any]:
+        return {
+            "window_pnl":         0.0,
+            "disabled_until_ts":  None,
+            "breach_at":          None,
+            "last_updated":       None,
+        }
+
+    def _load_state(self, asset: str) -> Dict[str, Any]:
+        asset = asset.lower()
+        with self._lock:
+            if asset in self._state:
+                return dict(self._state[asset])
+
+        loaded: Optional[Dict[str, Any]] = None
+        if _redis_available:
+            raw = redis_get_json(_cooldown_redis_key(asset))
+            if isinstance(raw, dict):
+                loaded = raw
+
+        if loaded is None:
+            path = _cooldown_local_path(asset)
+            try:
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        loaded = data
+            except Exception as e:
+                print(f"⚠️ [COOLDOWN] Could not read {path}: {e}")
+
+        state = self._empty_state()
+        if loaded:
+            wp = loaded.get("window_pnl", 0.0)
+            state["window_pnl"] = float(wp) if _is_finite_number(wp) else 0.0
+            dut = loaded.get("disabled_until_ts")
+            if dut is not None and _is_finite_number(dut):
+                state["disabled_until_ts"] = float(dut)
+            state["breach_at"]    = loaded.get("breach_at")
+            state["last_updated"] = loaded.get("last_updated")
+
+        self._expire_if_needed(asset, state, persist=False)
+        with self._lock:
+            self._state[asset] = state
+        return dict(state)
+
+    def _persist_state(self, asset: str, state: Dict[str, Any]) -> None:
+        asset = asset.lower()
+        payload = {
+            "window_pnl":        round(float(state.get("window_pnl", 0.0)), 4),
+            "disabled_until_ts": state.get("disabled_until_ts"),
+            "breach_at":         state.get("breach_at"),
+            "last_updated":      datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        state["last_updated"] = payload["last_updated"]
+        if _redis_available:
+            redis_set_json(_cooldown_redis_key(asset), payload)
+        try:
+            path = _cooldown_local_path(asset)
+            tmp  = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except Exception as e:
+            print(f"⚠️ [COOLDOWN] Local persist failed for {asset.upper()} (non-fatal): {e}")
+
+    def _expire_if_needed(
+        self, asset: str, state: Dict[str, Any], *, persist: bool = True,
+    ) -> bool:
+        """If cooldown has expired, reset window_pnl and re-enable trading."""
+        dut = state.get("disabled_until_ts")
+        if dut is None or not _is_finite_number(dut):
+            return False
+        now = t.time()
+        if now < float(dut):
+            return False
+
+        asset_up = asset.upper()
+        print(f"[COOLDOWN] {asset_up} cooldown expired")
+        print(f"[COOLDOWN] {asset_up} trading re-enabled")
+        exec_log(
+            "cooldown_expired",
+            asset=asset,
+            previous_window_pnl=state.get("window_pnl"),
+        )
+
+        state["window_pnl"]        = 0.0
+        state["disabled_until_ts"] = None
+        state["breach_at"]         = None
+        if persist:
+            self._persist_state(asset, state)
+        return True
+
+    def record_realized_pnl(self, asset: str, pnl_amount: float) -> None:
+        """Add realized PnL to the cooldown window; trigger cooldown on breach."""
+        if not _is_finite_number(pnl_amount):
+            return
+
+        asset = asset.lower()
+        with self._lock:
+            state = self._load_state(asset)
+            self._expire_if_needed(asset, state)
+
+            if state.get("disabled_until_ts") is not None:
+                # Already in cooldown — do not extend the window counter; exits
+                # during cooldown are handled by TP/SL but start fresh after expiry.
+                self._state[asset] = state
+                return
+
+            state["window_pnl"] = round(state["window_pnl"] + float(pnl_amount), 4)
+            self._state[asset]  = state
+
+            if state["window_pnl"] > -ASSET_MAX_CUMULATIVE_LOSS:
+                self._persist_state(asset, state)
+                return
+
+            until_ts = t.time() + ASSET_COOLDOWN_SECONDS
+            until_dt = datetime.fromtimestamp(until_ts, tz=timezone.utc)
+            until_str = until_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            state["disabled_until_ts"] = until_ts
+            state["breach_at"]         = until_str
+            self._state[asset]         = state
+            self._persist_state(asset, state)
+
+        asset_up = asset.upper()
+        print(
+            f"[COOLDOWN] {asset_up} cumulative PnL reached "
+            f"-${abs(state['window_pnl']):.2f}"
+        )
+        print(f"[COOLDOWN] {asset_up} trading disabled until {until_str} UTC")
+        exec_log(
+            "cooldown_triggered",
+            asset=asset,
+            window_pnl=state["window_pnl"],
+            disabled_until_utc=until_str,
+            max_loss=ASSET_MAX_CUMULATIVE_LOSS,
+            cooldown_minutes=ASSET_COOLDOWN_MINUTES,
+        )
+
+    def is_entry_blocked(self, asset: str) -> bool:
+        """Return True when new entries must be blocked for this asset."""
+        asset = asset.lower()
+        with self._lock:
+            state = self._load_state(asset)
+            expired = self._expire_if_needed(asset, state)
+            if expired:
+                self._state[asset] = state
+            blocked = state.get("disabled_until_ts") is not None
+            self._state[asset] = state
+            return blocked
+
+    def get_status(self, asset: str) -> Dict[str, Any]:
+        asset = asset.lower()
+        with self._lock:
+            state = self._load_state(asset)
+            self._expire_if_needed(asset, state)
+            self._state[asset] = state
+
+        dut = state.get("disabled_until_ts")
+        now = t.time()
+        active = dut is not None and _is_finite_number(dut) and now < float(dut)
+        remaining = max(0, int(float(dut) - now)) if active and dut is not None else 0
+        until_utc = None
+        if active and dut is not None:
+            until_utc = datetime.fromtimestamp(float(dut), tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+        return {
+            "cooldown_active":          active,
+            "cooldown_window_pnl":      round(float(state.get("window_pnl", 0.0)), 2),
+            "cooldown_until_utc":       until_utc,
+            "cooldown_remaining_sec":   remaining,
+            "cooldown_max_loss":        ASSET_MAX_CUMULATIVE_LOSS,
+            "cooldown_minutes":         ASSET_COOLDOWN_MINUTES,
+            "entries_blocked_cooldown": active,
+        }
+
+    def get_all_statuses(self) -> Dict[str, Dict[str, Any]]:
+        return {a: self.get_status(a) for a in TRADING_ASSETS}
+
+
+asset_cooldown = AssetCooldownManager()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2343,6 +2624,14 @@ class MarketWorker:
             log_weekend_block(self.asset_type, "YES/NO", round(max(y, n) * 100))
             return
 
+        # ── ASSET COOLDOWN GATE ─────────────────────────────────────────
+        # Blocks new entries when this asset's cooldown-window realized PnL
+        # has breached -ASSET_MAX_CUMULATIVE_LOSS. Independent per asset.
+        # TP/SL on existing positions already returned above when FILLED.
+        if asset_cooldown.is_entry_blocked(self.asset_type):
+            log_cooldown_block(self.asset_type, "YES/NO", round(max(y, n) * 100))
+            return
+
         # ── IDLE: look for first qualifying side ─────────────────────────
 
         # Evaluate YES first.
@@ -2420,6 +2709,11 @@ class MarketWorker:
             # Prevent entering if a position is already open.
             if self.trade_state != TradeState.IDLE:
                 print(f"⚠️ [ABORT] Trade state is {self.trade_state.name} — entry suppressed.")
+                return
+            if asset_cooldown.is_entry_blocked(self.asset_type):
+                print(f"🚫 [COOLDOWN] [{self.asset_type.upper()}] BUY blocked — asset in cooldown.")
+                exec_log("execute_order_cooldown_blocked", side=side, price=price,
+                         asset=self.asset_type)
                 return
             if price < MIN_ENTRY_PRICE:
                 print(f"⚠️ [ABORT] Price {round(price*100)}c is below MIN_ENTRY_PRICE "
@@ -3037,6 +3331,9 @@ class MarketWorker:
         self._append_trade_to_redis(entry)
         self._last_logged_slug = slug
 
+        # Cooldown risk tracker — separate from lifetime cumulative_pnl above.
+        asset_cooldown.record_realized_pnl(self.asset_type, pnl_amount)
+
         # ── Live portfolio history snapshot ──────────────────────────────
         # Push a portfolio-total point to emiliano:portfolio:history right
         # now so the chart updates the moment this trade closes, without
@@ -3106,6 +3403,9 @@ class MarketWorker:
             market_end_iso   = expiry.isoformat()
             market_start_iso = start.isoformat()
 
+        cd = asset_cooldown.get_status(self.asset_type)
+        schedule_ok = is_trading_allowed()
+
         return {
             "asset":              self.asset_type.upper(),
             "yes":                round(self.prices.get("YES", 0) * 100),
@@ -3133,8 +3433,15 @@ class MarketWorker:
             "no_threshold":       round(MIN_ENTRY_PRICE * 100),
             "locked_low_c":       round(LOCKED_LOW  * 100),
             "locked_high_c":      round(LOCKED_HIGH * 100),
-            "trading_allowed":    is_trading_allowed(),
+            "trading_allowed":    schedule_ok,
             "trading_tz":         _TRADING_TZ_NAME,
+            "entry_allowed":      schedule_ok and not cd.get("cooldown_active", False),
+            "cooldown_active":          cd.get("cooldown_active", False),
+            "cooldown_window_pnl":      cd.get("cooldown_window_pnl", 0.0),
+            "cooldown_until_utc":       cd.get("cooldown_until_utc"),
+            "cooldown_remaining_sec":   cd.get("cooldown_remaining_sec", 0),
+            "cooldown_max_loss":        cd.get("cooldown_max_loss", ASSET_MAX_CUMULATIVE_LOSS),
+            "entries_blocked_cooldown": cd.get("entries_blocked_cooldown", False),
         }
 
     def print_final_summary(self):
@@ -3337,6 +3644,11 @@ def create_dashboard(bots):
         else:
             display_status = d.get('status', 'WAITING')
 
+        cd = asset_cooldown.get_status(bot.asset_type)
+        if cd.get("cooldown_active"):
+            rem = cd.get("cooldown_remaining_sec", 0)
+            display_status = f"COOLDOWN {rem // 60}m{rem % 60:02d}s"
+
         # Binance signal display
         ratio    = d.get('imbalance_ratio',    0.0)
         momentum = d.get('imbalance_momentum', 0.0)
@@ -3387,6 +3699,9 @@ def create_dashboard(bots):
                 f"Skip locked: {round(LOCKED_LOW*100)}c & {round(LOCKED_HIGH*100)}c[/dim]"
             )
 
+        cd_pnl_color = "red" if cd.get("cooldown_window_pnl", 0) < 0 else "green"
+        cd_blocked   = " | [bold red]ENTRIES BLOCKED[/bold red]" if cd.get("cooldown_active") else ""
+
         card = Panel(
             Text.from_markup(
                 f"""[yellow]YES:[/] {d.get('yes', 0):>3}c    [yellow]NO:[/] {d.get('no', 0):>3}c
@@ -3395,6 +3710,7 @@ def create_dashboard(bots):
 [magenta]Status:[/] {display_status}
 {bought_text}
 [bold]ROI:[/] [{pnl_color}]+${pnl_dollars:.2f} ({pnl_pct:+.2f}%)[/{pnl_color}]
+[bold]Cooldown PnL:[/] [{cd_pnl_color}]${cd.get('cooldown_window_pnl', 0):+.2f}[/] (limit -${ASSET_MAX_CUMULATIVE_LOSS:.2f}){cd_blocked}
 [bold]Binance Imb:[/] {ratio_text} {momentum_text}
 [bold]Outcome:[/] [bold {'green' if d.get('outcome') == 'YES' else 'red' if d.get('outcome') == 'NO' else 'white'}]{d.get('outcome', 'PENDING')}[/]"""
             ),

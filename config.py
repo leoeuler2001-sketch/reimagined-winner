@@ -132,7 +132,58 @@ def trading_assets_label(separator: str = " · ") -> str:
     return separator.join(TRADING_ASSETS_UPPER)
 
 
+# ── Asset-level circuit breaker / cooldown ───────────────────────────────────
+#
+# When an asset's cooldown-window realized PnL falls below -ASSET_MAX_CUMULATIVE_LOSS,
+# new entries for that asset are blocked for ASSET_COOLDOWN_MINUTES. Existing positions
+# continue to be managed (TP/SL, manual exit). See bot.AssetCooldownManager.
+
+
+def _parse_positive_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        _fatal(f"{name}={raw!r} is not a valid number.")
+    if value <= 0 or value != value or value in (float("inf"), float("-inf")):
+        _fatal(f"{name} must be a positive number (got {raw!r}).")
+    return value
+
+
+def _parse_positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        _fatal(f"{name}={raw!r} is not a valid integer.")
+    if value <= 0:
+        _fatal(f"{name} must be a positive integer (got {raw!r}).")
+    return value
+
+
+ASSET_MAX_CUMULATIVE_LOSS: float = _parse_positive_float_env(
+    "ASSET_MAX_CUMULATIVE_LOSS", 3.00,
+)
+ASSET_COOLDOWN_MINUTES: int = _parse_positive_int_env(
+    "ASSET_COOLDOWN_MINUTES", 30,
+)
+ASSET_COOLDOWN_SECONDS: int = ASSET_COOLDOWN_MINUTES * 60
+
+
+def validate_asset_cooldown_config() -> tuple[float, int]:
+    """Explicit startup hook; values are validated at import time."""
+    return ASSET_MAX_CUMULATIVE_LOSS, ASSET_COOLDOWN_MINUTES
+
+
 print(
     f"📌 Trading assets ({len(TRADING_ASSETS)}): "
     + ", ".join(TRADING_ASSETS_UPPER)
+)
+print(
+    f"🛡️  Asset cooldown: max loss ${ASSET_MAX_CUMULATIVE_LOSS:.2f} | "
+    f"cooldown {ASSET_COOLDOWN_MINUTES} min"
 )

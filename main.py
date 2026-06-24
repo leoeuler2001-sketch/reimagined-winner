@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from config import (  # noqa: E402 — env must be loaded first
+    ASSET_COOLDOWN_MINUTES,
+    ASSET_MAX_CUMULATIVE_LOSS,
     TRADING_ASSETS,
     TRADING_ASSETS_UPPER,
     trading_assets_label,
@@ -69,6 +71,7 @@ try:
         get_trade_history,
         trade_history_backfill,
         find_worker_by_asset,
+        asset_cooldown,
     )
     _positions_available = True
 except ImportError:
@@ -82,43 +85,12 @@ except ImportError:
         return []
 
     def trade_history_backfill() -> int:  # type: ignore
-      return 0
+        return 0
 
     def find_worker_by_asset(workers, asset) -> "MarketWorker | None":  # type: ignore
         return None
 
-    # Fallback stubs so the dashboard still renders without the updated bot.py
-    def is_trading_allowed() -> bool:     # type: ignore
-        return True
-    _TRADING_TZ_NAME = "UTC"             # type: ignore
-    TRADING_DAYS     = frozenset({0,1,2,3,4})  # type: ignore
-    _DAY_NAMES: dict = {0:"Monday",1:"Tuesday",2:"Wednesday",  # type: ignore
-                        3:"Thursday",4:"Friday",5:"Saturday",6:"Sunday"}
-    MARKET_INTERVAL_SLUG = "5m"  # type: ignore
-
-    def _fallback_sanitize_portfolio_history(points, drop_isolated_spikes: bool = True):
-        """Minimal stand-in used only if an older bot.py lacks the real
-        sanitize_portfolio_history(). Validates, de-duplicates by timestamp
-        (last write wins), and sorts chronologically. Does not include the
-        isolated-spike filter — upgrade bot.py to get that."""
-        cleaned = {}
-        for p in points or []:
-            if not isinstance(p, dict):
-                continue
-            t_raw, v_raw = p.get("t"), p.get("v")
-            if t_raw is None or v_raw is None:
-                continue
-            try:
-                t_ms = int(t_raw)
-                v    = float(v_raw)
-            except (TypeError, ValueError):
-                continue
-            if t_ms <= 0 or v != v or v in (float("inf"), float("-inf")):
-                continue
-            cleaned[t_ms] = round(v, 4)
-        return [{"t": ts, "v": v} for ts, v in sorted(cleaned.items())]
-
-    sanitize_portfolio_history = _fallback_sanitize_portfolio_history
+    asset_cooldown = None  # type: ignore
 
 # MARKET_INTERVAL_SLUG comes from bot when available; config holds asset list only.
 try:
@@ -144,9 +116,11 @@ def _bot_name_from_url(url: str) -> str:
 
 def _app_config_payload() -> dict:
     return {
-        "trading_assets":       list(TRADING_ASSETS_UPPER),
-        "market_interval":      MARKET_INTERVAL_SLUG,
-        "trading_assets_label": trading_assets_label(),
+        "trading_assets":           list(TRADING_ASSETS_UPPER),
+        "market_interval":          MARKET_INTERVAL_SLUG,
+        "trading_assets_label":     trading_assets_label(),
+        "asset_max_cumulative_loss": ASSET_MAX_CUMULATIVE_LOSS,
+        "asset_cooldown_minutes":   ASSET_COOLDOWN_MINUTES,
     }
 
 
@@ -377,6 +351,9 @@ def get_global_stats() -> dict:
             "total_wins": 0, "total_losses": 0, "win_rate": 0.0,
             "trading_allowed": _trading_ok,
             "trading_tz":      _TRADING_TZ_NAME,
+            "assets_in_cooldown": 0,
+            "asset_max_loss": ASSET_MAX_CUMULATIVE_LOSS,
+            "asset_cooldown_minutes": ASSET_COOLDOWN_MINUTES,
         }
 
     from bot import TradeState  # local import to avoid circular issues
@@ -408,18 +385,30 @@ def get_global_stats() -> dict:
     total_trades = total_wins + total_losses
     win_rate     = round((total_wins / total_trades) * 100, 1) if total_trades > 0 else 0.0
 
+    assets_in_cooldown = 0
+    if asset_cooldown is not None:
+        try:
+            for a in TRADING_ASSETS:
+                if asset_cooldown.get_status(a).get("cooldown_active"):
+                    assets_in_cooldown += 1
+        except Exception:
+            pass
+
     return {
-        "total_bots":      len(bots),
-        "active_bots":     active_count,
-        "total_pnl":       round(total_pnl, 2),
-        "in_profit":       in_profit_count,
-        "in_loss":         in_loss_count,
-        "total_trades":    total_trades,
-        "total_wins":      total_wins,
-        "total_losses":    total_losses,
-        "win_rate":        win_rate,
-        "trading_allowed": _trading_ok,
-        "trading_tz":      _TRADING_TZ_NAME,
+        "total_bots":           len(bots),
+        "active_bots":          active_count,
+        "total_pnl":            round(total_pnl, 2),
+        "in_profit":            in_profit_count,
+        "in_loss":              in_loss_count,
+        "total_trades":         total_trades,
+        "total_wins":           total_wins,
+        "total_losses":         total_losses,
+        "win_rate":             win_rate,
+        "trading_allowed":      _trading_ok,
+        "trading_tz":           _TRADING_TZ_NAME,
+        "assets_in_cooldown":   assets_in_cooldown,
+        "asset_max_loss":       ASSET_MAX_CUMULATIVE_LOSS,
+        "asset_cooldown_minutes": ASSET_COOLDOWN_MINUTES,
     }
 
 
@@ -1408,20 +1397,28 @@ function renderGlobalStats(g) {
   if (banner && dot && schedTxt) {
     const allowed  = g.trading_allowed ?? true;
     const tz       = g.trading_tz || 'UTC';
-    if (allowed) {
+    const inCd     = (g.assets_in_cooldown ?? 0) > 0;
+    if (allowed && !inCd) {
       banner.className   = banner.className.replace(
         /bg-\S+|text-\S+|border-\S+/g, '').trim() +
         ' bg-emerald-950 text-emerald-400 border border-emerald-900';
       dot.className      = 'w-2 h-2 rounded-full bg-emerald-400 inline-block flex-shrink-0';
       schedTxt.textContent =
         `✅ Trading ACTIVE — new entries permitted (${tz})`;
-    } else {
+    } else if (!allowed) {
       banner.className   = banner.className.replace(
         /bg-\S+|text-\S+|border-\S+/g, '').trim() +
         ' bg-yellow-950 text-yellow-400 border border-yellow-900';
       dot.className      = 'w-2 h-2 rounded-full bg-yellow-400 inline-block flex-shrink-0';
       schedTxt.textContent =
         `🚫 Weekend — new entries BLOCKED (${tz}). TP/SL and portfolio tracking continue.`;
+    } else {
+      banner.className   = banner.className.replace(
+        /bg-\S+|text-\S+|border-\S+/g, '').trim() +
+        ' bg-orange-950 text-orange-400 border border-orange-900';
+      dot.className      = 'w-2 h-2 rounded-full bg-orange-400 inline-block flex-shrink-0';
+      schedTxt.textContent =
+        `🛡️ ${g.assets_in_cooldown} asset(s) in COOLDOWN — new entries blocked for those assets. TP/SL continues.`;
     }
   }
 }
@@ -1488,13 +1485,23 @@ function renderBots(bots){
     i++;
   }
 }
+function _fmtCooldownRemaining(sec) {
+  const s = Math.max(0, Number(sec) || 0);
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}m ${String(r).padStart(2, '0')}s`;
+}
+
 function renderCard(bot){
   const hasPos=bot.position&&bot.position!=='-';
   const pnlPos=(bot.pnl_dollars||0)>=0;
   const cumPos=(bot.cumulative_pnl||0)>=0;
   const inProfit=hasPos&&(bot.pnl_dollars||0)>0;
   const inLoss=hasPos&&(bot.pnl_dollars||0)<0;
-  const border=inProfit?'border-l-4 border-emerald-500':inLoss?'border-l-4 border-red-500':hasPos?'border-l-4 border-sky-500':'';
+  const inCooldown=!!bot.cooldown_active;
+  const cdPnl=Number(bot.cooldown_window_pnl)||0;
+  const cdPnlPos=cdPnl>=0;
+  const border=inProfit?'border-l-4 border-emerald-500':inLoss?'border-l-4 border-red-500':inCooldown?'border-l-4 border-orange-500':hasPos?'border-l-4 border-sky-500':'';
   const signal=bot.imbalance_signal||'NEUTRAL';
   const wins=bot.wins??0;const losses=bot.losses??0;
   const trades=bot.trade_count??0;const wr=bot.win_rate??0;
@@ -1503,9 +1510,16 @@ function renderCard(bot){
     ?`<span class="text-xs bg-emerald-950 text-emerald-400 px-2 py-0.5 rounded-full font-semibold">🟢 IN PROFIT</span>`
     :inLoss
       ?`<span class="text-xs bg-red-950 text-red-400 px-2 py-0.5 rounded-full font-semibold">🔴 IN LOSS</span>`
+      :inCooldown
+        ?`<span class="text-xs bg-orange-950 text-orange-400 px-2 py-0.5 rounded-full font-semibold">🛡️ COOLDOWN</span>`
       :hasPos
         ?`<span class="text-xs bg-sky-900 text-sky-300 px-2 py-0.5 rounded-full">⚡ IN POSITION</span>`
         :`<span class="text-xs bg-zinc-800 text-zinc-400 px-2 py-0.5 rounded-full">WAITING</span>`;
+  const cooldownBlock=inCooldown?`
+      <div class="bg-orange-950/40 border border-orange-900/60 rounded-xl px-3 py-2 mb-3 text-xs text-orange-300">
+        <div class="font-semibold mb-0.5">New entries blocked — cooldown active</div>
+        <div class="font-mono text-orange-400/90">Until ${bot.cooldown_until_utc||'?'} UTC · ${_fmtCooldownRemaining(bot.cooldown_remaining_sec)} left</div>
+      </div>`:'';
   return`
     <div class="${border} rounded-2xl pl-3">
       <div class="flex items-center justify-between mb-1">
@@ -1516,6 +1530,7 @@ function renderCard(bot){
         <span class="text-zinc-500 text-xs font-mono">${bot.timer||'--:--'}</span>
       </div>
       <div class="text-zinc-500 text-xs mb-3 font-mono">${mw}</div>
+      ${cooldownBlock}
       <div class="flex gap-3 mb-3">
         <div class="flex-1 bg-zinc-800 rounded-xl p-2 text-center">
           <div class="text-zinc-400 text-xs mb-0.5">YES</div>
@@ -1550,6 +1565,12 @@ function renderCard(bot){
           <span class="text-zinc-400">Cumulative PnL</span>
           <span class="font-mono font-semibold ${cumPos?'text-emerald-300':'text-red-300'}" style="font-variant-numeric:tabular-nums;">
             ${_displayCumulativePnl(bot.cumulative_pnl)}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-zinc-400">Cooldown window PnL</span>
+          <span class="font-mono text-xs ${cdPnlPos?'text-emerald-400':'text-orange-400'}" style="font-variant-numeric:tabular-nums;" title="Resets after cooldown · limit -$${bot.cooldown_max_loss??''}">
+            ${_displayCumulativePnl(cdPnl)}
           </span>
         </div>
         <div class="flex items-center justify-between">
