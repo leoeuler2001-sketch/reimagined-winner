@@ -515,6 +515,14 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     }
     .pm-per-btn.act { background:#22c55e; color:#0a0a0a; }
     .pm-val-block { padding:6px 20px 0; display:flex; flex-direction:column; align-items:flex-start; gap:4px; }
+    .pm-balance-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .pm-balance-toggle {
+      background:none; border:none; color:#71717a; cursor:pointer;
+      padding:8px; border-radius:10px; transition:color .15s,background .15s;
+      font-size:17px; line-height:1; flex-shrink:0;
+    }
+    .pm-balance-toggle:hover { color:#a1a1aa; background:rgba(255,255,255,0.06); }
+    .pm-balance-toggle:focus-visible { outline:2px solid #22c55e; outline-offset:2px; }
     .pm-big-val { font-family:'Inter',system-ui,sans-serif; font-size:40px; font-weight:800; line-height:1; letter-spacing:-.04em; }
     .pm-big-val.pos { color:#22c55e; } .pm-big-val.neg { color:#ef4444; } .pm-big-val.neu { color:#e4e4e7; }
     .pm-change-lbl { font-family:'JetBrains Mono','Consolas',monospace; font-variant-numeric:tabular-nums; font-size:12px; font-weight:600; color:#71717a; letter-spacing:.01em; }
@@ -654,7 +662,13 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="pm-val-block">
-      <div class="pm-big-val neu" id="pm-bigval">$0.00</div>
+      <div class="pm-balance-row">
+        <div class="pm-big-val neu" id="pm-bigval">$0.00</div>
+        <button class="pm-balance-toggle" id="pm-balance-toggle" type="button"
+                aria-label="Hide balances" aria-pressed="true" onclick="toggleBalanceVisibility()">
+          <i class="fa-solid fa-eye" id="pm-balance-toggle-icon"></i>
+        </button>
+      </div>
       <span class="pm-change-lbl" id="pm-change-lbl">Loading history…</span>
     </div>
     <div class="pm-chart-box" id="pm-chart-box">
@@ -685,7 +699,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   <div class="pm-card" id="portfolio-tabs-card">
     <div class="pm-section-tabs">
       <button class="pm-section-tab act" id="tab-btn-trades" onclick="setPortfolioTab('trades')">Trades</button>
-      <button class="pm-section-tab" id="tab-btn-positions" onclick="setPortfolioTab('positions')">Positions</button>
+      <button class="pm-section-tab" id="tab-btn-positions" onclick="setPortfolioTab('positions')">Positions (0)</button>
       <button class="pm-section-tab" id="tab-btn-history" onclick="setPortfolioTab('history')">History</button>
     </div>
     <div id="panel-trades" class="pm-section-panel pm-trades-panel">
@@ -719,7 +733,9 @@ const _PERIOD_MS = {
   '1Y':  365 * 24 * 60 * 60 * 1000,
 };
 const _FLAT_EPS = 0.005;
+const _BALANCE_LS_KEY = 'pm_balance_visible';
 
+let _balanceVisible = true;
 let _historyPts    = [];
 let _livePts       = [];
 let _pnlPeriod     = '1D';
@@ -731,6 +747,67 @@ let _chartRaf      = 0;
 
 function _isFiniteNum(v) {
   return typeof v === 'number' && isFinite(v);
+}
+
+function _loadBalancePref() {
+  try {
+    const v = localStorage.getItem(_BALANCE_LS_KEY);
+    if (v === '0' || v === 'false') _balanceVisible = false;
+  } catch (e) { /* private browsing */ }
+}
+
+function _saveBalancePref() {
+  try {
+    localStorage.setItem(_BALANCE_LS_KEY, _balanceVisible ? '1' : '0');
+  } catch (e) { /* private browsing */ }
+}
+
+function _maskUsd() { return '••••'; }
+function _maskCents() { return '•••'; }
+
+function _displayBigVal(val) {
+  if (!_balanceVisible) return _maskUsd();
+  return (val >= 0 ? '' : '-') + '$' + Math.abs(val).toFixed(2);
+}
+
+function _displayPeriodChange(change, pct, arrow, periodLabel) {
+  const pctStr = pct !== null
+    ? ` (${change >= 0 ? '+' : ''}${pct.toFixed(1)}%)`
+    : '';
+  if (!_balanceVisible) {
+    const maskedPart = pct !== null ? pctStr : _maskUsd();
+    return `${maskedPart}  ${arrow}  ${periodLabel}`;
+  }
+  const sign = change >= 0 ? '+' : '';
+  return `${sign}$${Math.abs(change).toFixed(2)}${pctStr}  ${arrow}  ${periodLabel}`;
+}
+
+function _updateBalanceToggleUI() {
+  const btn = document.getElementById('pm-balance-toggle');
+  const icon = document.getElementById('pm-balance-toggle-icon');
+  if (!btn || !icon) return;
+  btn.setAttribute('aria-pressed', _balanceVisible ? 'true' : 'false');
+  btn.setAttribute('aria-label', _balanceVisible ? 'Hide balances' : 'Show balances');
+  icon.className = _balanceVisible ? 'fa-solid fa-eye' : 'fa-solid fa-eye-slash';
+}
+
+function toggleBalanceVisibility() {
+  _balanceVisible = !_balanceVisible;
+  _saveBalancePref();
+  _updateBalanceToggleUI();
+  refreshBalanceSensitiveUI();
+}
+
+function refreshBalanceSensitiveUI() {
+  updatePnlChart();
+  renderPositions(window._lastPositions || []);
+  if (window._lastBots) renderBots(window._lastBots);
+  if (window._lastTradeHistory) renderTradeHistory(window._lastTradeHistory);
+}
+
+function _updatePositionsTabCount(count) {
+  const btn = document.getElementById('tab-btn-positions');
+  if (btn) btn.textContent = 'Positions (' + (count || 0) + ')';
 }
 
 function _periodLabel(p, tMin, tMax) {
@@ -885,8 +962,9 @@ function updatePnlChart() {
 
   const bigEl = document.getElementById('pm-bigval');
   if (bigEl) {
-    bigEl.textContent = (totalPnl >= 0 ? '' : '-') + '$' + Math.abs(totalPnl).toFixed(2);
-    bigEl.className   = 'pm-big-val ' + (totalPnl > 0 ? 'pos' : totalPnl < 0 ? 'neg' : 'neu');
+    bigEl.textContent = _displayBigVal(totalPnl);
+    bigEl.className   = 'pm-big-val ' + (!_balanceVisible ? 'neu'
+      : (totalPnl > 0 ? 'pos' : totalPnl < 0 ? 'neg' : 'neu'));
   }
 
   const triEl = document.getElementById('pm-tri');
@@ -898,11 +976,9 @@ function updatePnlChart() {
   const chEl = document.getElementById('pm-change-lbl');
   if (chEl) {
     if (basePts.length > 1) {
-      const arrow  = periodChange >= 0 ? '▲' : '▼';
-      const sign   = periodChange >= 0 ? '+' : '';
-      const pctStr = periodChangePct !== null
-        ? ` (${sign}${periodChangePct.toFixed(1)}%)` : '';
-      chEl.textContent = `${sign}$${Math.abs(periodChange).toFixed(2)}${pctStr}  ${arrow}  ${_periodLabel(_pnlPeriod, tMin, tMax)}`;
+      const arrow = periodChange >= 0 ? '▲' : '▼';
+      chEl.textContent = _displayPeriodChange(
+        periodChange, periodChangePct, arrow, _periodLabel(_pnlPeriod, tMin, tMax));
       chEl.className   = 'pm-change-lbl ' + (periodChange >= 0 ? 'pos' : 'neg');
     } else {
       chEl.textContent = _historyLoaded ? _periodLabel(_pnlPeriod, tMin, tMax) : 'Loading…';
@@ -1057,8 +1133,9 @@ function _initChartOverlay() {
                 dot.removeAttribute('display'); }
     const bigEl = document.getElementById('pm-bigval');
     if (bigEl) {
-      bigEl.textContent = (pt.v>=0?'':'-')+'$'+Math.abs(pt.v).toFixed(2);
-      bigEl.className   = 'pm-big-val '+(pt.v>0?'pos':pt.v<0?'neg':'neu');
+      bigEl.textContent = _displayBigVal(pt.v);
+      bigEl.className   = 'pm-big-val ' + (!_balanceVisible ? 'neu'
+        : (pt.v > 0 ? 'pos' : pt.v < 0 ? 'neg' : 'neu'));
     }
     const triEl = document.getElementById('pm-tri');
     if (triEl) { triEl.textContent=pt.v>=0?'▲':'▼'; triEl.className='pm-tri '+(pt.v>=0?'pos':'neg'); }
@@ -1079,8 +1156,9 @@ function _initChartOverlay() {
     if (!c) return;
     const bigEl = document.getElementById('pm-bigval');
     if (bigEl) {
-      bigEl.textContent = (c.origVal>=0?'':'-')+'$'+Math.abs(c.origVal).toFixed(2);
-      bigEl.className   = 'pm-big-val '+(c.origVal>0?'pos':c.origVal<0?'neg':'neu');
+      bigEl.textContent = _displayBigVal(c.origVal);
+      bigEl.className   = 'pm-big-val ' + (!_balanceVisible ? 'neu'
+        : (c.origVal > 0 ? 'pos' : c.origVal < 0 ? 'neg' : 'neu'));
     }
     const triEl = document.getElementById('pm-tri');
     if (triEl) {
@@ -1123,11 +1201,13 @@ function connect() {
   ws.onerror = () => ws.close();
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
+    window._lastBots = d.bots || [];
+    window._lastTradeHistory = d.trade_history || [];
     renderGlobalStats(d.global_stats);
     pushLivePnlPoint(d.global_stats.total_pnl ?? 0);
-    renderBots(d.bots);
+    renderBots(window._lastBots);
     renderPositions(d.positions || []);
-    renderTradeHistory(d.trade_history || []);
+    renderTradeHistory(window._lastTradeHistory);
     if (d.config) renderAppConfig(d.config);
   };
 }
@@ -1147,7 +1227,10 @@ async function loadPositionsAndHistory() {
       fetch('/api/trades/history?limit=10'),
     ]);
     if (pRes.ok) renderPositions((await pRes.json()).positions || []);
-    if (hRes.ok) renderTradeHistory((await hRes.json()).trades || []);
+    if (hRes.ok) {
+      window._lastTradeHistory = (await hRes.json()).trades || [];
+      renderTradeHistory(window._lastTradeHistory);
+    }
   } catch (e) { console.warn('loadPositionsAndHistory:', e); }
 }
 loadPositionsAndHistory();
@@ -1168,12 +1251,36 @@ function setPortfolioTab(tab) {
 }
 
 function _fmtUsd(v, signed) {
+  if (!_balanceVisible) return _maskUsd();
   const n = Number(v) || 0;
   const sign = signed && n > 0 ? '+' : (signed && n < 0 ? '' : '');
   return sign + '$' + Math.abs(n).toFixed(2);
 }
 
-function _fmtCents(c) { return (Number(c) || 0).toFixed(1) + '¢'; }
+function _fmtCents(c) {
+  if (!_balanceVisible) return _maskCents();
+  return (Number(c) || 0).toFixed(1) + '¢';
+}
+
+function _displayTradePnl(dollars, pct) {
+  const pctPart = ` (${(Number(pct) || 0).toFixed(1)}%)`;
+  if (!_balanceVisible) return _maskUsd() + pctPart;
+  const n = Number(dollars) || 0;
+  const pnlPos = n >= 0;
+  return `${pnlPos ? '+' : ''}$${Math.abs(n).toFixed(2)}${pctPart}`;
+}
+
+function _displayCumulativePnl(val) {
+  if (!_balanceVisible) return _maskUsd();
+  const n = Number(val) || 0;
+  const cumPos = n >= 0;
+  return `${cumPos ? '+' : ''}$${Math.abs(n).toFixed(2)}`;
+}
+
+function _displayYesNoPrice(val) {
+  if (!_balanceVisible) return _maskCents();
+  return (Number(val) || 0) + '¢';
+}
 
 function _shortMarket(name) {
   if (!name) return '—';
@@ -1181,14 +1288,15 @@ function _shortMarket(name) {
 }
 
 function renderPositions(positions) {
-  window._lastPositions = positions;
+  window._lastPositions = positions || [];
+  _updatePositionsTabCount(window._lastPositions.length);
   const el = document.getElementById('positions-list');
   if (!el) return;
-  if (!positions || positions.length === 0) {
+  if (window._lastPositions.length === 0) {
     el.innerHTML = '<div class="pm-empty">No open positions</div>';
     return;
   }
-  el.innerHTML = positions.map(p => {
+  el.innerHTML = window._lastPositions.map(p => {
     const roi = Number(p.roi_pct) || 0;
     const pnl = Number(p.unrealized_pnl) || 0;
     const roiCls = roi >= 0 ? 'pos' : 'neg';
@@ -1225,6 +1333,7 @@ function _historyActionStyle(action) {
 }
 
 function renderTradeHistory(trades) {
+  window._lastTradeHistory = trades || [];
   const el = document.getElementById('history-list');
   if (!el) return;
   if (!trades || trades.length === 0) {
@@ -1359,9 +1468,10 @@ function formatMarketWindow(s,e){
 // BOT CARDS
 // ═══════════════════════════════════════════════════════════════════
 function renderBots(bots){
+  window._lastBots = bots || [];
   const c=document.getElementById('bots-container');
   if(!c) return;
-  bots.forEach((bot,i)=>{
+  window._lastBots.forEach((bot,i)=>{
     let card=document.getElementById(`bot-card-${i}`);
     if(!card){
       card=document.createElement('div');
@@ -1372,7 +1482,7 @@ function renderBots(bots){
     card.innerHTML=renderCard(bot);
   });
   // Remove stale cards when asset count decreases (e.g. config change).
-  let i=bots.length;
+  let i=window._lastBots.length;
   while(document.getElementById(`bot-card-${i}`)){
     document.getElementById(`bot-card-${i}`).remove();
     i++;
@@ -1409,11 +1519,11 @@ function renderCard(bot){
       <div class="flex gap-3 mb-3">
         <div class="flex-1 bg-zinc-800 rounded-xl p-2 text-center">
           <div class="text-zinc-400 text-xs mb-0.5">YES</div>
-          <div class="text-lg font-bold text-emerald-400 font-mono" style="font-variant-numeric:tabular-nums;">${bot.yes||0}¢</div>
+          <div class="text-lg font-bold text-emerald-400 font-mono" style="font-variant-numeric:tabular-nums;">${_displayYesNoPrice(bot.yes||0)}</div>
         </div>
         <div class="flex-1 bg-zinc-800 rounded-xl p-2 text-center">
           <div class="text-zinc-400 text-xs mb-0.5">NO</div>
-          <div class="text-lg font-bold text-red-400 font-mono" style="font-variant-numeric:tabular-nums;">${bot.no||0}¢</div>
+          <div class="text-lg font-bold text-red-400 font-mono" style="font-variant-numeric:tabular-nums;">${_displayYesNoPrice(bot.no||0)}</div>
         </div>
       </div>
       <div class="bg-zinc-800 rounded-xl px-3 py-2 mb-3 flex items-center justify-between gap-2 flex-wrap">
@@ -1433,13 +1543,13 @@ function renderCard(bot){
         <div class="flex items-center justify-between">
           <span class="text-zinc-400">Trade PnL</span>
           <span class="font-mono ${pnlPos?'text-emerald-400':'text-red-400'}" style="font-variant-numeric:tabular-nums;">
-            ${pnlPos?'+':''}$${(bot.pnl_dollars||0).toFixed(2)} (${(bot.pnl_pct||0).toFixed(1)}%)
+            ${_displayTradePnl(bot.pnl_dollars, bot.pnl_pct)}
           </span>
         </div>
         <div class="flex items-center justify-between">
           <span class="text-zinc-400">Cumulative PnL</span>
           <span class="font-mono font-semibold ${cumPos?'text-emerald-300':'text-red-300'}" style="font-variant-numeric:tabular-nums;">
-            ${cumPos?'+':''}$${(bot.cumulative_pnl||0).toFixed(2)}
+            ${_displayCumulativePnl(bot.cumulative_pnl)}
           </span>
         </div>
         <div class="flex items-center justify-between">
@@ -1465,6 +1575,8 @@ function renderCard(bot){
 // Boot: init crosshair, then load history immediately from the backend.
 // The backend will return backfilled historical data so the chart shows
 // past performance right away — not an empty chart from today.
+_loadBalancePref();
+_updateBalanceToggleUI();
 _initChartOverlay();
 loadHistory(_pnlPeriod);
 </script>
