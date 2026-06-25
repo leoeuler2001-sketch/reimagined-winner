@@ -1,0 +1,39 @@
+strategies:
+  spread_capture:
+    enabled: true
+    spread_threshold: 0.99
+    trade_cooldown_ms: 5000
+    max_position_size: 10
+
+  momentum:
+    enabled: true
+    lookback_secs: 2
+    entry_min_delta: 0.004
+    execution_mode: single_taker
+    momentum_size: 10
+
+  market_making:
+    enabled: true
+    max_buy_order_size: 20
+    cancel_threshold: 0.003
+    imbalance_threshold: 30
+    requote_delay_ms: 500
+
+stop_loss:
+  stop_loss_usd: 50
+  stop_loss_cooldown_secs: 300
+
+assets:
+  - BTC
+  - ETH
+  - SOL
+  - XRP
+  - DOGE
+  - BNB
+
+windows:
+  - 5m
+  - 15m
+  - 1hr
+
+dry_run: false

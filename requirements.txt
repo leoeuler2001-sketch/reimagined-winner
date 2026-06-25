@@ -12,5 +12,6 @@ fastapi
 uvicorn[standard]
 tzdata
 jinja2
+PyYAML
 setuptools
 wheel

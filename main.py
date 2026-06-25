@@ -24,6 +24,30 @@ from config import (  # noqa: E402 — env must be loaded first
 
 validate_trading_assets()
 
+# ── Multi-strategy orchestrator ───────────────────────────────────────────────
+try:
+    from bot import redis_get_json, redis_set_json, _redis_available  # type: ignore
+    from strategies.orchestrator import (
+        init_orchestrator,
+        get_orchestrator,
+        install_sigterm_handler,
+    )
+    _strategies_available = True
+except ImportError as _strat_err:
+    print(f"⚠️  Strategy modules not available: {_strat_err}")
+    _strategies_available = False
+    init_orchestrator = None  # type: ignore
+    get_orchestrator = lambda: None  # type: ignore
+    install_sigterm_handler = lambda _loop: None  # type: ignore
+    redis_get_json = None  # type: ignore
+    redis_set_json = None  # type: ignore
+    _redis_available = False
+
+try:
+    from strategy_settings import STRATEGY_CONFIG  # type: ignore
+except ImportError:
+    STRATEGY_CONFIG = {"dry_run": True, "strategies": {}}  # type: ignore
+
 if TYPE_CHECKING:
     from bot import AccountService, MarketWorker
 
@@ -137,6 +161,7 @@ except Exception:
 
 bots:               list[Any]      = []
 account:            Any            = None
+strategy_orchestrator: Any         = None
 active_connections: list[WebSocket] = []
 
 # ── In-memory snapshot buffer ─────────────────────────────────────────────────
@@ -162,16 +187,15 @@ async def startup_event():
 
 
 async def _initialize_bots():
-    global bots, account
+    global bots, account, strategy_orchestrator
     print("🚀 Emiliano Dashboard Starting on Render...")
     bots = []
 
-    if _AccountService is None or _MarketWorker is None:
-        print("❌ Cannot start bots — AccountService/MarketWorker failed to import.")
+    if _AccountService is None:
+        print("❌ Cannot start — AccountService failed to import.")
         return
 
     try:
-        # ── One-time account-level init ───────────────────────────────────
         print("Initializing AccountService (wallet audit runs once here)...")
         account = _AccountService()
         if not account.run_wallet_audit():
@@ -180,11 +204,23 @@ async def _initialize_bots():
         account.start_pnl_merge_scheduler()
         print("✅ AccountService ready.")
 
-        # ── Per-asset market workers ──────────────────────────────────────
-        for asset in TRADING_ASSETS:
-            print(f"Initializing {asset.upper()} Bot...")
-            bots.append(_MarketWorker(asset, account))
-            print(f"✅ {asset.upper()} Bot initialized")
+        if _strategies_available and init_orchestrator and redis_get_json:
+            install_sigterm_handler(asyncio.get_running_loop())
+            strategy_orchestrator = await init_orchestrator(
+                account, redis_get_json, redis_set_json, _redis_available,
+            )
+            await strategy_orchestrator.start()
+            print(
+                f"✅ Strategy orchestrator: {len(strategy_orchestrator.instances)} tasks "
+                f"(dry_run={strategy_orchestrator.dry_run})"
+            )
+        elif _MarketWorker is not None:
+            for asset in TRADING_ASSETS:
+                print(f"Initializing {asset.upper()} Bot (legacy)...")
+                bots.append(_MarketWorker(asset, account))
+        else:
+            print("❌ No orchestrator and no MarketWorker available.")
+            return
 
         # ── Portfolio history backfill ────────────────────────────────────
         # Runs exactly once at startup.  Reads emiliano:{asset}:trades from
@@ -228,15 +264,14 @@ async def _initialize_bots():
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def run_all_bots():
-    if not bots:
+    tasks = [broadcast_loop(), keep_alive_heartbeat(), portfolio_snapshot_loop()]
+    if bots:
+        tasks.extend(bot.start() for bot in bots)
+    if not tasks:
+        await asyncio.sleep(3600)
         return
     try:
-        await asyncio.gather(
-            *[bot.start() for bot in bots],
-            broadcast_loop(),
-            keep_alive_heartbeat(),
-            portfolio_snapshot_loop(),
-        )
+        await asyncio.gather(*tasks)
     except Exception as e:
         print(f"Background tasks error: {e}")
         traceback.print_exc()
@@ -324,6 +359,7 @@ async def broadcast_loop():
                 "positions":     collect_open_positions(bots),
                 "trade_history": get_trade_history(10),
                 "config":        _app_config_payload(),
+                "strategy_status": _strategy_status_payload(),
                 "timestamp":     asyncio.get_running_loop().time(),
             }
             message = json.dumps(data)
@@ -338,6 +374,17 @@ async def broadcast_loop():
         except Exception as e:
             print(f"Broadcast error: {e}")
             await asyncio.sleep(3)
+
+
+def _strategy_status_payload() -> dict:
+    orch = get_orchestrator() if _strategies_available else None
+    if orch is None:
+        return {"rows": [], "pnl": {}}
+    return {
+        "rows": orch.status_rows(),
+        "pnl": orch.stop_loss.get_pnl_summary(orch.positions),
+        "dry_run": orch.dry_run,
+    }
 
 
 def get_global_stats() -> dict:
@@ -1657,6 +1704,65 @@ async def api_trades_history(limit: int = 10):
     """Most recent executed BUY/SELL records, newest first."""
     lim = max(1, min(limit, 50))
     return JSONResponse({"trades": get_trade_history(lim)})
+
+
+# ── Multi-strategy endpoints (additive — do not replace /api/* routes) ───────
+
+@app.get("/positions")
+async def strategy_positions():
+    """Current inventory per strategy/asset/window from Redis."""
+    orch = get_orchestrator() if _strategies_available else None
+    if orch is None:
+        return JSONResponse({"positions": {}, "source": "none"})
+    return JSONResponse({"positions": orch.positions.snapshot()})
+
+
+@app.get("/pnl")
+async def strategy_pnl():
+    """Realized + unrealized PnL per strategy and total."""
+    orch = get_orchestrator() if _strategies_available else None
+    if orch is None:
+        return JSONResponse({"error": "orchestrator not running"}, status_code=503)
+    return JSONResponse(orch.stop_loss.get_pnl_summary(orch.positions))
+
+
+@app.post("/strategy/{name}/pause")
+async def strategy_pause(name: str):
+    allowed = {"spread_capture", "momentum", "market_making"}
+    if name not in allowed:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy {name!r}")
+    orch = get_orchestrator() if _strategies_available else None
+    if orch is None:
+        raise HTTPException(status_code=503, detail="Orchestrator not running")
+    n = orch.pause_strategy(name)
+    return JSONResponse({"ok": True, "strategy": name, "instances_paused": n})
+
+
+@app.post("/strategy/{name}/resume")
+async def strategy_resume(name: str):
+    allowed = {"spread_capture", "momentum", "market_making"}
+    if name not in allowed:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy {name!r}")
+    orch = get_orchestrator() if _strategies_available else None
+    if orch is None:
+        raise HTTPException(status_code=503, detail="Orchestrator not running")
+    n = orch.resume_strategy(name)
+    return JSONResponse({"ok": True, "strategy": name, "instances_resumed": n})
+
+
+@app.post("/stop")
+async def strategy_manual_stop():
+    """Manually trigger global stop-loss shutdown."""
+    orch = get_orchestrator() if _strategies_available else None
+    if orch is None:
+        raise HTTPException(status_code=503, detail="Orchestrator not running")
+    await orch.stop_loss.manual_stop()
+    return JSONResponse({"ok": True, "stop_loss_state": orch.stop_loss.state})
+
+
+@app.get("/api/strategy/status")
+async def api_strategy_status():
+    return JSONResponse(_strategy_status_payload())
 
 
 @app.post("/api/positions/{asset}/cashout")

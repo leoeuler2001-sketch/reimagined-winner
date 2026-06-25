@@ -1767,8 +1767,31 @@ class BinanceDepthSignal:
         self.imbalance   = 0.0
         self.momentum    = 0.0
         self.last_update = 0.0
+        self.mid_price:  float = 0.0
+        self._prev_mid:  float = 0.0
         self._history: deque = deque(maxlen=8)
         self._running    = False
+        self._price_callbacks: list = []
+
+    def subscribe_price(self, callback) -> None:
+        """Register async or sync callback(price: float, ts: float) on each update."""
+        if callback not in self._price_callbacks:
+            self._price_callbacks.append(callback)
+
+    def _emit_price(self, mid: float) -> None:
+        self._prev_mid = self.mid_price if self.mid_price > 0 else mid
+        self.mid_price = mid
+        ts = t.time()
+        for cb in list(self._price_callbacks):
+            try:
+                result = cb(mid, ts)
+                if asyncio.iscoroutine(result):
+                    try:
+                        asyncio.get_running_loop().create_task(result)
+                    except RuntimeError:
+                        pass
+            except Exception as e:
+                print(f"⚠️ [Binance WS] price callback error {self.symbol}: {e}")
 
     @property
     def is_fresh(self) -> bool:
@@ -1824,6 +1847,13 @@ class BinanceDepthSignal:
         total = bid_v + ask_v
         if total <= 0:
             return
+        try:
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            if best_bid > 0 and best_ask > 0:
+                self._emit_price((best_bid + best_ask) / 2.0)
+        except (TypeError, ValueError, IndexError):
+            pass
         raw = (bid_v - ask_v) / total
         self._history.append(raw)
         self.last_update = t.time()
@@ -2134,11 +2164,19 @@ class AccountService:
 
     # ── Shared order execution helpers (used by every MarketWorker) ─────────
 
-    def create_and_post_order(self, side_str: str, price: float, size: float, token_id: str):
+    def create_and_post_order(
+        self,
+        side_str: str,
+        price: float,
+        size: float,
+        token_id: str,
+        order_type: Optional[Any] = None,
+    ):
         """Build + submit an order through the single shared ClobClient."""
         order_args   = OrderArgs(price=price, size=size, side=side_str, token_id=token_id)
         signed_order = self.client.create_order(order_args)
-        resp         = self.client.post_order(signed_order, cast(OrderType, OrderType.GTC))
+        ot = order_type if order_type is not None else OrderType.GTC
+        resp         = self.client.post_order(signed_order, cast(OrderType, ot))
         return resp
 
     def get_order_status(self, order_id: str):
@@ -3609,13 +3647,21 @@ def create_dashboard(bots):
     )
     _tz_label = _TRADING_TZ_NAME
 
+    _strat_hdr = ""
+    try:
+        from strategies.orchestrator import get_orchestrator
+        _orch = get_orchestrator()
+        if _orch is not None:
+            _strat_hdr = f"\n[bold magenta]Strategies:[/] {len(_orch.instances)} tasks | dry_run={_orch.dry_run}"
+    except Exception:
+        pass
+
     layout = Layout()
     layout.split_column(
         Layout(
             Panel(
-                f"[bold cyan]EMILIANO BOT — 90-Cent Single-Leg Entry | "
-                f"Binance WS Signal (Display)[/bold cyan]\n"
-                f"Schedule ({_tz_label}): {_schedule_str}",
+                f"[bold cyan]EMILIANO BOT — Multi-Strategy Engine[/bold cyan]\n"
+                f"Schedule ({_tz_label}): {_schedule_str}{_strat_hdr}",
                 style="bold green", box=box.ROUNDED,
             ),
             size=4,
@@ -3734,6 +3780,36 @@ def create_dashboard(bots):
                 layout["main"]["col2"].split_column(
                     layout["main"]["col2"].renderable, Layout(card, ratio=1))
     return layout
+
+
+def create_strategy_status_panel() -> Optional[Panel]:
+    """Rich panel: strategy task summary for terminal dashboard."""
+    try:
+        from strategies.orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        if orch is None:
+            return None
+        lines = []
+        for row in orch.status_rows()[:12]:
+            sig = row.get("last_signal")
+            sig_s = (
+                datetime.fromtimestamp(sig, tz=timezone.utc).strftime("%H:%M:%S")
+                if sig else "—"
+            )
+            lines.append(
+                f"{row['strategy']} {row['asset']}/{row['window']} "
+                f"{row['state']} | 5m={row['trades_5m']} | imb={row['imbalance']} | {sig_s}"
+            )
+        if len(orch.instances) > 12:
+            lines.append(f"... +{len(orch.instances) - 12} tasks")
+        return Panel(
+            "\n".join(lines) if lines else "No strategy tasks",
+            title="Strategy Engine",
+            border_style="magenta",
+            box=box.ROUNDED,
+        )
+    except Exception:
+        return None
 
 
 async def dashboard_loop(bots):
